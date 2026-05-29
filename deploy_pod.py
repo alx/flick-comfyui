@@ -104,7 +104,7 @@ GPU_QUERY = """
 { gpuTypes {
     id displayName memoryInGb secureCloud communityCloud
     lowestPrice(input: { gpuCount: 1 }) { stockStatus }
-    nodeGroupDatacenters { id gpuAvailability { gpuTypeId available } }
+    nodeGroupDatacenters { id }
 } }
 """
 
@@ -182,27 +182,21 @@ def delete_volume(volume_id: str) -> None:
 # GPU availability
 # ---------------------------------------------------------------------------
 
-SLOT_POLL_INTERVAL = 10  # seconds between fast slot checks
-
-
-def wait_for_slot(gpu_id: str, dc_id: str) -> None:
-    """Poll the targeted slot query until a slot opens in dc_id."""
-    while True:
+def _check_slot(gpu_id: str, dc_id: str) -> bool:
+    """Return True if a real-time slot is available for gpu_id in dc_id."""
+    try:
         data = gql(_slot_query(gpu_id, dc_id))
-        types = data.get("gpuTypes") or []
-        lp = (types[0].get("lowestPrice") if types else None) or {}
-        stock = lp.get("stockStatus", "OUT_OF_STOCK")
-        counts = lp.get("availableGpuCounts") or []
-        available = sum(c for c in counts if c and c > 0)
-        if stock != "OUT_OF_STOCK" and available > 0:
-            print(f"  Slot confirmed: {available} unit(s) free  [{stock}]")
-            return
-        print(f"  No slot yet ({stock}, available={available}). Checking again in {SLOT_POLL_INTERVAL}s...")
-        time.sleep(SLOT_POLL_INTERVAL)
+    except runpod_error.QueryError:
+        return False
+    types = data.get("gpuTypes") or []
+    lp = (types[0].get("lowestPrice") if types else None) or {}
+    stock = lp.get("stockStatus", "OUT_OF_STOCK")
+    counts = lp.get("availableGpuCounts") or []
+    return stock != "OUT_OF_STOCK" and sum(c for c in counts if c and c > 0) > 0
 
 
 def find_available_gpu(gpu_data: list[dict]) -> Optional[tuple[dict, str, float]]:
-    """Return (gpu, datacenter_id, price) for the best available GPU+DC, or None."""
+    """Return (gpu, datacenter_id, price) for the first preferred GPU+DC with a confirmed slot."""
     by_name: dict[str, dict] = {}
     for g in gpu_data:
         if g["memoryInGb"] < MIN_VRAM_GB:
@@ -212,17 +206,14 @@ def find_available_gpu(gpu_data: list[dict]) -> Optional[tuple[dict, str, float]
             continue
         by_name[g["displayName"]] = g
 
-    preference_map = dict(GPU_PREFERENCE)
-
+    # Only try listed GPUs; unlisted ones are not considered
     ordered = [(name, price) for name, price in GPU_PREFERENCE if name in by_name]
-    ordered += [(name, 0.0) for name in by_name if name not in preference_map]
 
     for name, price in ordered:
         g = by_name[name]
         for dc in g.get("nodeGroupDatacenters") or []:
-            for avail in dc.get("gpuAvailability") or []:
-                if avail.get("gpuTypeId") == g["id"] and avail.get("available"):
-                    return g, dc["id"], price
+            if _check_slot(g["id"], dc["id"]):
+                return g, dc["id"], price
 
     return None
 
@@ -303,9 +294,6 @@ def main() -> None:
         volume_id = None
         volume_created = False
         try:
-            print(f"\nWaiting for a confirmed slot on {selected_gpu['displayName']} in {selected_dc}...")
-            wait_for_slot(selected_gpu["id"], selected_dc)
-
             volume_id, volume_dc, volume_created = ensure_volume(args.network_volume_id, selected_dc)
 
             print("Deploying...")
